@@ -9,7 +9,7 @@ Recognized plugins export `GetPlugin`, `DestroyPlugin`, and `GetPluginManifest`;
 ## Requirements
 
 - *Sid Meier's Civilization VI* with the **Gathering Storm (Expansion 2)** ruleset. The mod only replaces the `Expansion2` GameCore row (see `Data/YKKZ000_GameCores.sql`).
-- Enable this mod **together with** the plugin mods it must load (for example `ykkz000's DLL Plugin API` and `ykkz000's Soviet Union (Rework)`). Only enabled mods' plugin directories are scanned.
+- Enable this mod **together with** the plugin mods whose DLL plugins it should load. Only enabled mods' plugin directories are scanned.
 
 ## Build Environment
 

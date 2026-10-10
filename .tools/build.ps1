@@ -84,13 +84,12 @@ Options:
                             Default: (none)
 
 Examples:
-  .\build.ps1 "ykkz000's Soviet Union (Rework).civ6proj"
+  .\build.ps1 "ykkz000's DLL Plugin Loader.civ6proj" --skip=art
   .\build.ps1 mod.civ6proj --clean -o "C:\temp\mod-build"
-  .\build.ps1 "ykkz000's Soviet Union (Rework).civ6proj" --force-rebuild=dll
-  .\build.ps1 "ykkz000's Soviet Union (Rework).civ6proj" --skip=art,dll
-  .\build.ps1 "ykkz000's Soviet Union (Rework).civ6proj" --force-rebuild=dll --cmake-arg=-DDISABLE_STRENGTH_PER_SUZERAIN=ON
-  .\build.ps1 "ykkz000's Soviet Union (Rework).civ6proj" --debug
-  .\build.ps1 "ykkz000's Soviet Union (Rework).civ6proj" --vcpkg-root C:\vcpkg
+  .\build.ps1 "ykkz000's DLL Plugin Loader.civ6proj" --force-rebuild=dll
+  .\build.ps1 "ykkz000's DLL Plugin Loader.civ6proj" --skip=art,dll
+  .\build.ps1 "ykkz000's DLL Plugin Loader.civ6proj" --debug
+  .\build.ps1 "ykkz000's DLL Plugin Loader.civ6proj" --vcpkg-root C:\vcpkg
 "@
 }
 

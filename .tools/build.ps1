@@ -622,6 +622,7 @@ function Read-Project {
     InGameActionData   = (& $getCdata 'InGameActionData')
     LocalizedTextData  = (& $getCdata 'LocalizedTextData')
     AssociationData    = (& $getCdata 'AssociationData')
+    DependencyData     = (& $getCdata 'DependencyData')
     Content            = $content
   }
 }
@@ -1120,6 +1121,10 @@ function New-ModInfo {
     Add-TextElement -Document $modDoc -Parent $props -Name 'Homepage' -Value $Project.Homepage
   }
   $root.AppendChild($props) | Out-Null
+
+  if (-not [string]::IsNullOrEmpty($Project.DependencyData)) {
+    $root.AppendChild($modDoc.ImportNode((ConvertFrom-XmlFragment $Project.DependencyData), $true)) | Out-Null
+  }
 
   if (-not [string]::IsNullOrEmpty($Project.AssociationData)) {
     $assocDoc = New-Object System.Xml.XmlDocument

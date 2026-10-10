@@ -14,6 +14,9 @@
     <SupportsHotSeat>true</SupportsHotSeat>
     <CompatibleVersions>1.2,2.0</CompatibleVersions>
     <FrontEndActionData><![CDATA[<FrontEndActions><UpdateDatabase id="YKKZ000_DLL_PLUGIN_LOADER_GAMECORES"><Properties><LoadOrder>99</LoadOrder></Properties><File>Data/YKKZ000_GameCores.sql</File></UpdateDatabase></FrontEndActions>]]></FrontEndActionData>
+    <DependencyData><![CDATA[<Dependencies>
+  <Mod id="4873eb62-8ccc-4574-b784-dda455e74e68" title="LOC_EXPANSION2_MOD_TITLE" />
+</Dependencies>]]></DependencyData>
     <LocalizedTextData><![CDATA[<LocalizedText><Text id="LOC_MOD_YKKZ000_DLL_PLUGIN_LOADER_NAME"><en_US>ykkz000's [COLOR_FLOAT_GOLD]DLL Plugin Loader[ENDCOLOR]</en_US><zh_Hans_CN>ykkz000的[COLOR_FLOAT_GOLD]DLL 插件加载器[ENDCOLOR]</zh_Hans_CN></Text><Text id="LOC_MOD_YKKZ000_DLL_PLUGIN_LOADER_TEASER"><en_US>Replaces the Gathering Storm GameCore DLL with a loader that loads ykkz000's DLL plugins from every enabled mod</en_US><zh_Hans_CN>用加载器替换风云变幻的 GameCore DLL，从所有已启用的模组中加载 ykkz000 的 DLL 插件</zh_Hans_CN></Text><Text id="LOC_MOD_YKKZ000_DLL_PLUGIN_LOADER_DESCRIPTION"><en_US>Replaces the Gathering Storm GameCore DLL with a loader that discovers and loads ykkz000 DLL plugins shipped by enabled mods.[NEWLINE]Required by [COLOR_FLOAT_GOLD]ykkz000's Soviet Union (Rework)[ENDCOLOR] and [COLOR_FLOAT_GOLD]ykkz000's DLL Plugin API[ENDCOLOR].[NEWLINE]Supported Languages: English, 简体中文</en_US><zh_Hans_CN>用加载器替换风云变幻的 GameCore DLL，自动发现并加载已启用模组所提供的 ykkz000 DLL 插件。[NEWLINE]为 [COLOR_FLOAT_GOLD]ykkz000的苏联（重做版）[ENDCOLOR] 与 [COLOR_FLOAT_GOLD]ykkz000的DLL 插件 API[ENDCOLOR] 的前置。[NEWLINE]支持的语言：English，简体中文</zh_Hans_CN></Text></LocalizedText>]]></LocalizedTextData>
     <AssemblyName>ykkz000's DLL Plugin Loader</AssemblyName>
     <RootNamespace>ykkz000's DLL Plugin Loader</RootNamespace>

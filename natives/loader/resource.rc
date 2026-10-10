@@ -1,0 +1,31 @@
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,0,0,0
+ PRODUCTVERSION  1,0,0,0
+ FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+ FILEFLAGS       0x0L
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_DLL
+ FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "ykkz000\0"
+            VALUE "FileDescription",  "Plugin loader replacing the GameCore DLL for ykkz000's DLL plugins\0"
+            VALUE "FileVersion",      "1.0.0.0\0"
+            VALUE "InternalName",     "GameCore_YKKZ000_Loader_XP2\0"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 ykkz000. Includes MinHook (C) 2009-2017 Tsuda Kageyu and Hacker Disassembler Engine (C) 2008-2009 Vyacheslav Patkov (BSD 2-Clause), and Apache log4cxx / APR / APR-util (Apache-2.0) and Expat (MIT).\0"
+            VALUE "OriginalFilename", "GameCore_YKKZ000_Loader_XP2.dll\0"
+            VALUE "ProductName",      "ykkz000's DLL Plugin Loader\0"
+            VALUE "ProductVersion",   "1.0.0.0\0"
+            VALUE "Comments",         "Third-party notices: see THIRD_PARTY_NOTICES.txt in the mod package.\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

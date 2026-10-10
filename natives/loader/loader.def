@@ -1,0 +1,6 @@
+LIBRARY GameCore_YKKZ000_Loader_XP2
+EXPORTS
+  DllCreateGameContext       @155
+  DllDestroyGameContext      @156
+  EXP_GetTelemetrySessionHash @157
+  InitLoader                 @158

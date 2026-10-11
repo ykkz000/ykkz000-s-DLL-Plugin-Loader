@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ykkz000/bridge/host.h>
@@ -161,17 +162,46 @@ struct GameCoreApi {
   ///       entry; when missing, only the corresponding hook is skipped (diagnostics + invalid
   ///       handler guard).
   void*   effectHandlerDispatch = nullptr;
-  /// @note Enabled-mod query (optional, non-fatal). The engine keeps the live modding settings in an
-  ///       in-memory object whose pointer lives in a global; the object is null until the engine
-  ///       publishes the settings. enabledModsContainer is the address of that global (a data
-  ///       pointer), getEnabledMods is the accessor FUN_180164870(container, out) that enumerates
-  ///       the ENABLED_MODS collection into an engine vector of {const char* id, const char* title}
-  ///       entries, and vectorDeallocate is the engine's std::vector release helper FUN_18009d470
-  ///       used to free that vector. When any of them is missing the enabled-mod list is reported
-  ///       as unavailable and cross-mod discovery degrades to the loader's own directory.
+  /// @note Enabled-mod query and construction (optional, non-fatal). The engine keeps the live
+  ///       modding settings in an in-memory object whose pointer lives in a global; the object is
+  ///       null until the engine publishes the settings. enabledModsContainer is the address of that
+  ///       global (a data pointer), getEnabledMods is the accessor FUN_180164870(container, out)
+  ///       that enumerates the ENABLED_MODS collection into an engine vector of {const char* id,
+  ///       const char* title} entries, and vectorDeallocate is the engine's std::vector release
+  ///       helper FUN_18009d470 used to free that vector. When any of them is missing the engine
+  ///       list is reported as unavailable to plugins (cross-mod plugin discovery does not use this
+  ///       query; it is driven by the Mods.sqlite selected group).
+  ///       enabledModsHash is the address of the uint32 section-key hash ("ENABLED_MODS"), and
+  ///       modIdHash/modTitleKeyHash are the property-bag field-key hashes of an ENABLED_MODS
+  ///       element ("MOD_ID" and the title key), all data uint32 globals a built section uses.
   void*   enabledModsContainer = nullptr; ///< Address of the settings-container global (data)
   void*   getEnabledMods = nullptr;       ///< FUN_180164870(container, out)
   void*   vectorDeallocate = nullptr;     ///< FUN_18009d470(vector, data, count)
+  void*   enabledModsHash = nullptr;      ///< &DAT_180b8c468 (data; uint32 section hash)
+  void*   modIdHash = nullptr;            ///< &DAT_180b8c470 (data; uint32 MOD_ID key hash)
+  void*   modTitleKeyHash = nullptr;      ///< &DAT_180b8c474 (data; uint32 title key hash)
+  /// @note Enabled-mod construction primitives (optional, non-fatal) used by
+  ///       buildAndInsertEnabledMods (enabled_mods_build.cpp) to build an ENABLED_MODS section with
+  ///       the engine's own object constructors and map/vector-map write primitives. All are
+  ///       DataVariant internals resolved by RVA on the locked build:
+  ///       variantMapCtor = FUN_18099e4b0(obj): Data_TypedVariantMap constructor for a 0x58-byte
+  ///       object (the tag 0xA payload / configuration-manager layout);
+  ///       vectorMapCtor = FUN_1809a7740(obj): Data_TypedVariantVectorMap constructor for a
+  ///       0x48-byte object (tag 0xB payload) whose element vector lives at +0x28 (begin) / +0x30
+  ///       (end) with 0x18-byte elements;
+  ///       variantMapInsert = FUN_18099fc60(map, key, variant): find-or-create by key then
+  ///       MOVE-assign the 0x18-byte variant into the node (shallow move: the map takes ownership of
+  ///       the payload pointer; the source is zeroed);
+  ///       variantMapFind = FUN_18099f570(map, key) -> variant* or null;
+  ///       vectorMapInsert = FUN_1809a7cc0(vectorAtMapPlus0x28, position, value): insert-at-position
+  ///       for the 0x18-byte element vector (position == current end appends).
+  ///       The objects themselves are allocated with mallocTemp. When any entry is missing
+  ///       buildAndInsertEnabledMods fails and gameplay/persistence are unaffected.
+  void*   variantMapCtor = nullptr;       ///< FUN_18099e4b0(obj): tag 0xA map constructor
+  void*   vectorMapCtor = nullptr;        ///< FUN_1809a7740(obj): tag 0xB vector-map constructor
+  void*   variantMapInsert = nullptr;     ///< FUN_18099fc60(map, key, variant): move-insert
+  void*   variantMapFind = nullptr;       ///< FUN_18099f570(map, key) -> variant*
+  void*   vectorMapInsert = nullptr;      ///< FUN_1809a7cc0(vector, position, value)
 };
 
 /// @brief Get this DLL's directory.
@@ -186,14 +216,6 @@ struct GameCoreApi {
 /// @brief Engine entry-point set (populated after gameCore resolves successfully; fields are
 ///        null before resolution).
 [[nodiscard]] const bridge::EngineApi& engineApi();
-
-// gamecore.cpp: enabled-mod query (the engine's live in-memory modding settings).
-/// @brief Read the engine's enabled-mod ids (a snapshot).
-/// @param[out] out Receives the ids when the list is available; left unchanged otherwise.
-/// @return true when the engine's enabled-mod list was read; false while it is not yet available
-///         (the engine publishes the settings only after it has loaded them).
-/// @note The first successful read is cached for the process lifetime.
-[[nodiscard]] bool enabledModIds(std::vector<std::string>& out);
 
 /// @brief Compute a string hash (same algorithm as the engine's MakeHash).
 /// @param[in] text Input text.
@@ -531,6 +553,30 @@ void teardownPluginEffects(void* pluginHandle);
 /// @brief Load all plugins.
 /// @param[in] host Host service table.
 void loadPlugins(bridge::Host* host);
+/// @brief Seed the enabled-mod ids of the Mods.sqlite selected group, read before the real
+///        DllCreateGameContext.
+/// @param[in] ids Enabled mod ids (ownership transferred).
+/// @note Consumed by loadPlugins, which then also discovers and loads the plugin directories of the
+///       other enabled mods in its own phase A (before the real DllCreateGameContext builds the
+///       effect database). Without a seed, cross-mod discovery stays limited to the Loader's own
+///       plugin directories; the deferred cross-mod phase can still pick up a later seed. The seed
+///       only feeds plugin discovery.
+void setGroupEnabledModIds(std::vector<std::string> ids);
+/// @brief Seed the .modinfo paths belonging to the ids from setGroupEnabledModIds.
+/// @param[in] idToModinfoPath Pairs of lowercase mod id and .modinfo path (ownership transferred).
+/// @note Optional enrichment for the seeded set: plugin discovery additionally probes the mod root
+///       (the .modinfo file's directory) of every seeded id, which covers enabled mods outside the
+///       Documents Mods and Workshop roots (for example base-game or DLC content). Paths may be
+///       absolute or relative to the game executable's directory, as Mods.sqlite stores them.
+void setGroupEnabledModInfoPaths(std::vector<std::pair<std::string, std::wstring>> idToModinfoPath);
+/// @brief Attempt the deferred cross-mod plugin load once the group-derived enabled set is
+///        available. Idempotent.
+/// @return true when cross-mod plugins have been loaded (or were already loaded), false while no
+///         group-derived set has been seeded (the caller should retry later).
+/// @note Phase A (loadPlugins) scans the Loader's own plugin directories and, when the group set was
+///       seeded, the other enabled mods' directories as well; this phase loads them when they could
+///       not be reached in phase A (the Mods.sqlite read succeeded only later).
+[[nodiscard]] bool loadCrossModPluginsDeferred();
 /// @brief Unload all plugins.
 void unloadPlugins();
 /// @brief Set the handle of the plugin currently being loaded.

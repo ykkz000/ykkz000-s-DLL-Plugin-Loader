@@ -66,7 +66,7 @@
 - Loader**必须**始终保持与游戏的GameCore DLL在游戏中被调用时的兼容性
 - Loader**必须**加载游戏的GameCore DLL，并在此基础上应用插件的修改，**禁止**直接替代游戏引擎
 - Loader**禁止**实现与修改游戏玩法相关的逻辑，与游戏玩法相关的逻辑均由插件修改
-- Loader 仅从**已启用**模组中发现插件；跨模组发现依赖引擎提供的 enabled-mod 列表，列表不可用时仅扫描 Loader 自身目录
+- Loader 仅从**已启用**模组中发现插件；跨模组发现的启用集来自 **`Mods.sqlite` 中选中（`Selected=1`）的 ModGroup**（`ModGroups`/`ModGroupItems`，含 DLC），在真实 `DllCreateGameContext` 之前读取；该来源不可用时仅扫描 Loader 自身目录
 
 ### 插件契约（Loader 侧）
 

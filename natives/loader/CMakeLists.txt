@@ -13,6 +13,8 @@ add_library(YKKZ000Loader SHARED
   src/memory_probe.cpp
   src/crash_capture.cpp
   src/serialization_trace.cpp
+  src/enabled_mods_build.cpp
+  src/mods_sqlite.cpp
   src/plugin_manager.cpp
   resource.rc
   loader.def)

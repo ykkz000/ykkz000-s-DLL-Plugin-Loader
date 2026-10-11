@@ -170,6 +170,25 @@ struct BuildProfile {
   std::ptrdiff_t rvaEnabledModsContainer;
   std::ptrdiff_t rvaGetEnabledMods;
   std::ptrdiff_t rvaVectorDeallocate;
+  // Enabled-mod section and element keys (data; uint32): the ENABLED_MODS section-key hash and the
+  // property-bag field-key hashes of an element ("MOD_ID" and the title key). A section built by
+  // enabled_mods_build.cpp inserts its fields under exactly these keys.
+  std::ptrdiff_t rvaEnabledModsHash;
+  std::ptrdiff_t rvaModIdHash;
+  std::ptrdiff_t rvaModTitleKeyHash;
+  // Enabled-mod construction primitives (optional, non-fatal): the DataVariant object constructors
+  // and the map/vector-map write primitives buildAndInsertEnabledMods uses to build an ENABLED_MODS
+  // section. Verified at 0x180000000+rva on the release image:
+  //   * 0x99E4B0 FUN_18099e4b0(obj): Data_TypedVariantMap constructor (0x58-byte object).
+  //   * 0x9A7740 FUN_1809a7740(obj): Data_TypedVariantVectorMap constructor (0x48-byte object).
+  //   * 0x99FC60 FUN_18099fc60(map, key, variant): find-or-create by key, then MOVE-assign variant.
+  //   * 0x99F570 FUN_18099f570(map, key) -> variant*: BST lookup.
+  //   * 0x9A7CC0 FUN_1809a7cc0(vector, position, value): 0x18-byte element insert-at-position.
+  std::ptrdiff_t rvaVariantMapCtor;
+  std::ptrdiff_t rvaVectorMapCtor;
+  std::ptrdiff_t rvaVariantMapInsert;
+  std::ptrdiff_t rvaVariantMapFind;
+  std::ptrdiff_t rvaVectorMapInsert;
   // Anchor RVAs: used for the "identity self-check" (see resolveApi); they corroborate the
   // fingerprint.
   std::ptrdiff_t rvaEffectAnchor;
@@ -224,6 +243,14 @@ constexpr BuildProfile kKnownXp2Build{
     0xB8AA78,     // enabled-mod settings container pointer (data; DAT_180b8aa60 + 0x1B0)
     0x164870,     // FUN_180164870(container, out): enumerate the ENABLED_MODS collection
     0x9D470,      // FUN_18009d470(vector, data, count): engine std::vector release helper
+    0xB8C468,     // ENABLED_MODS section-key hash (data; uint32)
+    0xB8C470,     // ENABLED_MODS element MOD_ID property-bag key hash (data; uint32)
+    0xB8C474,     // ENABLED_MODS element title property-bag key hash (data; uint32)
+    0x99E4B0,     // FUN_18099e4b0(obj): Data_TypedVariantMap constructor
+    0x9A7740,     // FUN_1809a7740(obj): Data_TypedVariantVectorMap constructor
+    0x99FC60,     // FUN_18099fc60(map, key, variant): map find-or-create + move-assign
+    0x99F570,     // FUN_18099f570(map, key) -> variant*: map find
+    0x9A7CC0,     // FUN_1809a7cc0(vector, position, value): vector-map 0x18-byte insert
     0xAA4558,     // anchor: "Could not build a modifier factory because the effect <"
     0xAA4500,     // anchor: "… because the collection <"
     0xAA3A80,     // anchor: "INSERT OR IGNORE INTO Types(Type,Kind) VALUES(?,?)"
@@ -452,6 +479,14 @@ bool resolveApi(HMODULE module, GameCoreApi& out) {
       computeDataRva(kKnownXp2Build.rvaEnabledModsContainer);
   resolved.getEnabledMods = computeRva(kKnownXp2Build.rvaGetEnabledMods);
   resolved.vectorDeallocate = computeRva(kKnownXp2Build.rvaVectorDeallocate);
+  resolved.enabledModsHash = computeDataRva(kKnownXp2Build.rvaEnabledModsHash);
+  resolved.modIdHash = computeDataRva(kKnownXp2Build.rvaModIdHash);
+  resolved.modTitleKeyHash = computeDataRva(kKnownXp2Build.rvaModTitleKeyHash);
+  resolved.variantMapCtor = computeRva(kKnownXp2Build.rvaVariantMapCtor);
+  resolved.vectorMapCtor = computeRva(kKnownXp2Build.rvaVectorMapCtor);
+  resolved.variantMapInsert = computeRva(kKnownXp2Build.rvaVariantMapInsert);
+  resolved.variantMapFind = computeRva(kKnownXp2Build.rvaVariantMapFind);
+  resolved.vectorMapInsert = computeRva(kKnownXp2Build.rvaVectorMapInsert);
   resolved.module = module;
   // Record each entry's actual RVA (pure arithmetic check; identity verification was already done
   // by the anchor comparison above).
@@ -536,7 +571,16 @@ bool resolveApi(HMODULE module, GameCoreApi& out) {
          kKnownXp2Build.rvaGetEnabledMods);
   logRva("vectorDeallocate", resolved.vectorDeallocate, module,
          kKnownXp2Build.rvaVectorDeallocate);
+  logRva("variantMapCtor", resolved.variantMapCtor, module, kKnownXp2Build.rvaVariantMapCtor);
+  logRva("vectorMapCtor", resolved.vectorMapCtor, module, kKnownXp2Build.rvaVectorMapCtor);
+  logRva("variantMapInsert", resolved.variantMapInsert, module,
+         kKnownXp2Build.rvaVariantMapInsert);
+  logRva("variantMapFind", resolved.variantMapFind, module, kKnownXp2Build.rvaVariantMapFind);
+  logRva("vectorMapInsert", resolved.vectorMapInsert, module,
+         kKnownXp2Build.rvaVectorMapInsert);
   logDebugF("enabledModsContainer global=%p", resolved.enabledModsContainer);
+  logDebugF("enabledModsHash global=%p modIdHash global=%p modTitleKeyHash global=%p",
+            resolved.enabledModsHash, resolved.modIdHash, resolved.modTitleKeyHash);
   // cityCalculateYield / trackedValueAddStep are not fatal checks: when missing, the plugin skips
   // the corresponding hook/injection and the effect degrades gracefully, rather than preventing the
   // whole Loader from initializing.
@@ -690,16 +734,23 @@ bool queryEnabledMods(std::vector<std::string>& out) {
 }
 
 // Cache the first successful query: the enabled set is fixed for the process lifetime once the
-// engine has published it.
+// engine has published it. An empty result is NOT cached: the settings container can exist before
+// its ENABLED_MODS section is populated, and the engine fills it in only later (the loader's own mod
+// is always enabled, so a genuinely empty list never occurs). Caching an empty list would pin the
+// plugin-visible enabled-mod count to zero for the whole process.
 void refreshEnabledModsLocked() {
   if (g_enabledModsQueried) {
     return;
   }
   std::vector<std::string> ids;
-  if (queryEnabledMods(ids)) {
-    g_enabledMods = std::move(ids);
-    g_enabledModsQueried = true;
+  if (!queryEnabledMods(ids)) {
+    return;
   }
+  if (ids.empty()) {
+    return; // settings exist but are not populated yet; retry on a later query
+  }
+  g_enabledMods = std::move(ids);
+  g_enabledModsQueried = true;
 }
 
 std::uint32_t enabledModCount() {
@@ -783,16 +834,6 @@ std::wstring moduleDirectory() {
 
 std::uint32_t makeHash(const char* text) {
   return bridge::makeHash(text);
-}
-
-bool enabledModIds(std::vector<std::string>& out) {
-  std::lock_guard<std::mutex> guard(g_enabledModsMutex);
-  refreshEnabledModsLocked();
-  if (!g_enabledModsQueried) {
-    return false;
-  }
-  out = g_enabledMods;
-  return true;
 }
 
 bool ensureGameCoreLoaded() {

@@ -1,0 +1,3 @@
+-- No-op in-game action for ykkz000's DLL Plugin Loader.
+-- Its only purpose is to make the loader mod carry an in-game component so the
+-- engine applies its FrontEnd GameCores override during content configuration.

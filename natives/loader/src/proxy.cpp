@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 #include <ykkz000/loader/internal.h>
 
+#include "mods_sqlite.h"
 #include "serialization_trace.h"
 
 namespace ykkz000::loader {
@@ -17,6 +19,7 @@ using DestroyGameContextFn = void (*)(void*);
 using TelemetryHashFn = std::uint64_t (*)();
 
 std::once_flag g_initOnce;
+std::once_flag g_pluginPhaseOnce;
 bool g_initialized = false;
 CreateGameContextFn g_realCreate = nullptr;
 DestroyGameContextFn g_realDestroy = nullptr;
@@ -111,13 +114,125 @@ bool initialize() {
     g_host.pluginHandle = nullptr;  // filled in by each plugin's Host copy
   }
 
-  // Registration must complete before the real DllCreateGameContext: it subsequently triggers
-  // ModifierLibrary::Initialize and DatabaseWriter::WriteEffectData.
+  return true;
+}
+
+// Mods.sqlite-derived enabled-mod source. The snapshot is cached together with the file identity
+// (LastWriteTime plus size): the first read happens in the pre-create plugin phase, and a later
+// context creation re-reads only when the engine rewrote the database. A snapshot that only becomes
+// usable after the plugin phase can still seed the deferred cross-mod load.
+struct ModsSqliteCache {
+  bool have = false;    // a file identity is recorded
+  bool ok = false;      // the last read produced a snapshot
+  bool applied = false; // the snapshot has been pushed into the plugin manager
+  std::uint64_t size = 0;
+  FILETIME writeTime = {};
+  ModsSqliteSnapshot snapshot;
+};
+
+ModsSqliteCache g_modsSqlite;
+
+// Read Mods.sqlite unless the cached snapshot still matches the file identity.
+bool readModsSqliteCached(ModsSqliteSnapshot& out) {
+  const std::wstring path = modsSqlitePath();
+  WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+  if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+    g_modsSqlite = ModsSqliteCache{}; // no database: there is no group-derived set
+    return false;
+  }
+  const std::uint64_t size =
+      (static_cast<std::uint64_t>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+  if (g_modsSqlite.have && g_modsSqlite.size == size &&
+      g_modsSqlite.writeTime.dwLowDateTime == attributes.ftLastWriteTime.dwLowDateTime &&
+      g_modsSqlite.writeTime.dwHighDateTime == attributes.ftLastWriteTime.dwHighDateTime) {
+    if (!g_modsSqlite.ok) {
+      return false;
+    }
+    out = g_modsSqlite.snapshot;
+    return true;
+  }
+  ModsSqliteSnapshot snapshot;
+  const bool ok = readModsSqlite(snapshot); // the module logs its own failures
+  g_modsSqlite.have = true;
+  g_modsSqlite.ok = ok;
+  g_modsSqlite.applied = false;
+  g_modsSqlite.size = size;
+  g_modsSqlite.writeTime = attributes.ftLastWriteTime;
+  g_modsSqlite.snapshot = snapshot;
+  if (!ok) {
+    return false;
+  }
+  out = std::move(snapshot);
+  return true;
+}
+
+// Push a snapshot into the plugin manager (once per read) and log its ids. Returns true when the
+// snapshot carries a usable enabled-mod set for this call.
+bool applyModsSqliteSnapshot(const ModsSqliteSnapshot& snapshot, bool attemptDeferred) {
+  if (snapshot.enabledModIds.empty()) {
+    logDebug("mods-sqlite: the selected group has no enabled members");
+    return false;
+  }
+  if (g_modsSqlite.applied) {
+    return true;
+  }
+  // The ids decide which mods' plugin directories are scanned; log them (debug build) so a missing
+  // enabled mod can be told apart from a discovery or dependency failure.
+  constexpr std::size_t kIdLogCap = 128;
+  const std::size_t logged =
+      snapshot.enabledModIds.size() < kIdLogCap ? snapshot.enabledModIds.size() : kIdLogCap;
+  for (std::size_t i = 0; i < logged; ++i) {
+    logDebugF("enabled-mods: sqlite id[%zu]=%s", i, snapshot.enabledModIds[i].c_str());
+  }
+  if (logged < snapshot.enabledModIds.size()) {
+    logDebugF("enabled-mods: sqlite id log truncated (%zu of %zu)", logged,
+              snapshot.enabledModIds.size());
+  }
+  setGroupEnabledModIds(snapshot.enabledModIds);
+  setGroupEnabledModInfoPaths(snapshot.idToModinfoPath);
+  g_modsSqlite.applied = true;
+  if (attemptDeferred) {
+    // The plugin phase already ran (this is a re-read in a later context): the newly seeded set can
+    // still feed the deferred cross-mod load.
+    (void)loadCrossModPluginsDeferred();
+  }
+  return true;
+}
+
+// Re-read after the plugin phase: the engine rewrites Mods.sqlite while it starts, so a rewrite (or
+// a first read that failed) can still supply the group-derived set to the deferred cross-mod phase.
+void refreshModsSqliteEnabledMods() {
+  ModsSqliteSnapshot snapshot;
+  if (!readModsSqliteCached(snapshot)) {
+    return;
+  }
+  (void)applyModsSqliteSnapshot(snapshot, /*attemptDeferred=*/true);
+}
+
+// Pre-create plugin phase: resolve the enabled-mod set, then load the plugins (including the
+// cross-mod directories that the set unlocks). Both steps must complete before the real
+// DllCreateGameContext, which subsequently triggers ModifierLibrary::Initialize and
+// DatabaseWriter::WriteEffectData: the plugins register their effect types here, and only a
+// registration that precedes that build is accepted by the engine. The only enabled-mod source is
+// the Mods.sqlite selected group; when it is unavailable, cross-mod discovery stays limited to the
+// Loader's own plugin directories (the deferred phase can still pick up a later group-derived
+// seed).
+void loadPluginsBeforeCreate() {
+  {
+    LogScope s("resolve enabled mods");
+    ModsSqliteSnapshot snapshot;
+    if (readModsSqliteCached(snapshot) && applyModsSqliteSnapshot(snapshot, false)) {
+      // The Mods.sqlite selected group seeded the set.
+    } else {
+      logInfo(
+          "enabled-mods: no Mods.sqlite selected group available; cross-mod discovery stays "
+          "limited to the Loader's own directory");
+    }
+  }
   {
     LogScope s("load plugins");
     loadPlugins(&g_host);
   }
-  return true;
 }
 
 } // namespace
@@ -139,14 +254,24 @@ void* createGameContext() {
   LogScope scope("create game context");
   logDebugF("context: created t0");
   initializeLoaderOnce();
-  // Notify plugins: a new context is being created. Plugins reinstall/re-enable their own hooks
-  // here and clear caches that become invalid with the context; the Loader no longer recognizes any
-  // concrete behavior, so there is no install*IfNeeded() anymore.
-  notifyPluginsGameContext(bridge::GameContextEvent::kCreated, nullptr);
+  // Re-assert the handler hooks (idempotent): the plugin phase below registers the effect types
+  // whose handler capture depends on these hooks, and the real create must be preceded by them.
   (void)installEffectHandlerHook();
   if (g_realCreate == nullptr) {
     return nullptr;
   }
+  // The plugin phase (Mods.sqlite selected-group read plus plugin load) runs once, at the first
+  // context creation, so the plugins register before the real create builds and validates the
+  // effect database. A later context cannot redo it: the engine validates the database only once
+  // per process.
+  std::call_once(g_pluginPhaseOnce, &loadPluginsBeforeCreate);
+  // Mods.sqlite may have been rewritten (or become readable) since the plugin phase; a re-read can
+  // still seed the deferred cross-mod load. No-op while the cached snapshot matches the file.
+  refreshModsSqliteEnabledMods();
+  // Notify plugins: a new context is being created. Plugins reinstall/re-enable their own hooks
+  // here and clear caches that become invalid with the context. The notification follows the load
+  // above, so plugins loaded in this call receive it for the current context.
+  notifyPluginsGameContext(bridge::GameContextEvent::kCreated, nullptr);
   LogScope call("call real DllCreateGameContext");
   return g_realCreate();
 }

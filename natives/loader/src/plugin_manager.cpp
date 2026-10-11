@@ -36,6 +36,20 @@ struct PluginSlot {
 
 std::vector<PluginSlot*> g_plugins;
 bool g_pluginsLoaded = false;
+bool g_crossModLoaded = false;
+// Stashed by loadPlugins (phase A) for the deferred cross-mod phase (phase B), so the cross-mod
+// discovery can initialize its plugins against the same host table without exposing g_host globally.
+bridge::Host* g_hostTemplate = nullptr;
+// Enabled-mod ids of the Mods.sqlite selected group (the ModGroups row with Selected set), seeded
+// by the proxy before the real DllCreateGameContext. Consumed by loadPlugins, which then scans the
+// cross-mod directories in phase A. Kept afterwards: a set seeded after phase A (a Mods.sqlite
+// re-read) still feeds the deferred cross-mod phase.
+std::vector<std::string> g_groupEnabledModIds;
+// The .modinfo paths belonging to g_groupEnabledModIds, as reported by the seeding source. Plugin
+// discovery probes the mod root (the .modinfo file's directory) of every seeded id in addition to
+// the Documents Mods and Workshop scans, covering enabled mods outside those roots (for example
+// base-game/DLC content).
+std::vector<std::pair<std::string, std::wstring>> g_groupEnabledModInfoPaths;
 
 std::mutex g_activeMutex;
 void* g_activePluginHandle = nullptr;
@@ -80,7 +94,10 @@ void addUnique(std::vector<std::wstring>& out, const std::wstring& path) {
   }
   const std::wstring candidate = normalized(path);
   for (const std::wstring& existing : out) {
-    if (existing == candidate) {
+    // Windows paths are case-insensitive: the same directory spelled with different casing (for
+    // example a registry Steam path versus its canonical form in libraryfolders.vdf) must collapse
+    // into one entry, or the directory is scanned and registered twice.
+    if (_wcsicmp(existing.c_str(), candidate.c_str()) == 0) {
       return;
     }
   }
@@ -88,11 +105,15 @@ void addUnique(std::vector<std::wstring>& out, const std::wstring& path) {
 }
 
 // -- Cross-mod plugin-directory discovery --
-// Besides the loader's own directory, discover the plugin directories carried by other *enabled*
-// mods: in the Documents Mods directory and in Steam Workshop content (AppID 289070). Only
-// directories literally named ykkz000_civ6_plugin are ever loaded, and only when the owning mod is
-// enabled in the engine's live in-memory modding settings; a mod whose id cannot be read or is not
-// enabled is skipped.
+// Besides the loader's own directory, discover the plugin directories carried by other mods: in the
+// Documents Mods directory and in Steam Workshop content (AppID 289070). Two views are derived from
+// the same layout:
+//   * the load view (addModPluginDir) keeps only *enabled* mods: only directories literally named
+//     ykkz000_civ6_plugin are ever loaded, and only when the owning mod is a member of the
+//     Mods.sqlite selected group; a mod whose id cannot be read or is not a member is skipped.
+//   * the dependency-search view (discoverAllModPluginDirs) keeps every mod's plugin directory
+//     regardless of the enabled state; those directories are registered on the DLL search path so a
+//     consumer can import the API DLLs another mod ships, but they are never scanned or loaded.
 
 bool isDirectory(const std::wstring& path) {
   const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -177,7 +198,26 @@ bool findTopLevelModInfo(const std::wstring& modRoot, std::wstring& out) {
   return found;
 }
 
-// Append the plugin directory of one mod root when its .modinfo id is in the enabled set.
+// Probe one mod root for its plugin directory (regardless of the mod's enabled state) and add it to
+// out. The plugin directory lives either under Binaries\Win64 (a normal deployment) or directly at
+// the mod root (some Workshop packages keep no Binaries layer).
+bool findModPluginDir(const std::wstring& modRoot, std::vector<std::wstring>& out) {
+  const std::wstring underBinaries = modRoot + L"\\Binaries\\Win64\\ykkz000_civ6_plugin";
+  if (isDirectory(underBinaries)) {
+    addUnique(out, underBinaries);
+    return true;
+  }
+  const std::wstring direct = modRoot + L"\\ykkz000_civ6_plugin";
+  if (isDirectory(direct)) {
+    addUnique(out, direct);
+    return true;
+  }
+  return false;
+}
+
+// Append the plugin directory of one mod root when its .modinfo id is in the enabled set. This
+// filtered view decides what the Loader *loads*; the unfiltered discovery below decides only which
+// directories the DLL loader may *resolve dependencies* from.
 void addModPluginDir(const std::wstring& modRoot, const std::unordered_set<std::string>& enabled,
                      std::vector<std::wstring>& out) {
   std::wstring modinfo;
@@ -193,17 +233,7 @@ void addModPluginDir(const std::wstring& modRoot, const std::unordered_set<std::
     logDebug(L"Mod is not enabled; skipping its plugin directory: " + modRoot);
     return;
   }
-  // The plugin directory lives either under Binaries\Win64 (a normal deployment) or directly at the
-  // mod root (some Workshop packages keep no Binaries layer).
-  const std::wstring underBinaries = modRoot + L"\\Binaries\\Win64\\ykkz000_civ6_plugin";
-  if (isDirectory(underBinaries)) {
-    addUnique(out, underBinaries);
-    return;
-  }
-  const std::wstring direct = modRoot + L"\\ykkz000_civ6_plugin";
-  if (isDirectory(direct)) {
-    addUnique(out, direct);
-  }
+  (void)findModPluginDir(modRoot, out);
 }
 
 // Enumerate immediate subdirectories of a mods container and add the enabled mods' plugin
@@ -228,6 +258,42 @@ void discoverModPluginDirs(const std::wstring& modsRoot,
       continue;
     }
     addModPluginDir(modsRoot + L"\\" + data.cFileName, enabled, out);
+  } while (FindNextFileW(find, &data) != FALSE);
+  FindClose(find);
+}
+
+// Enumerate immediate subdirectories of a mods container and add every mod's plugin directory,
+// regardless of the owning mod's enabled state. These directories feed only the process DLL search
+// path, so a disabled mod's plugin DLLs become resolvable as dependencies of an enabled plugin;
+// they are never scanned, loaded or initialized by the Loader.
+void discoverAllModPluginDirs(const std::wstring& modsRoot, std::vector<std::wstring>& out) {
+  if (!isDirectory(modsRoot)) {
+    return;
+  }
+  WIN32_FIND_DATAW data = {};
+  const std::wstring pattern = modsRoot + L"\\*";
+  HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+  if (find == INVALID_HANDLE_VALUE) {
+    return;
+  }
+  do {
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+      continue;
+    }
+    if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
+      continue;
+    }
+    const std::wstring modRoot = modsRoot + L"\\" + data.cFileName;
+    std::wstring modinfo;
+    if (!findTopLevelModInfo(modRoot, modinfo)) {
+      continue; // not a mod root
+    }
+    std::string id;
+    if (!readModInfoId(modinfo, id)) {
+      logDebug(L"Mod has no readable id; not used as a dependency search root: " + modRoot);
+      continue;
+    }
+    (void)findModPluginDir(modRoot, out);
   } while (FindNextFileW(find, &data) != FALSE);
   FindClose(find);
 }
@@ -331,40 +397,109 @@ void discoverWorkshopPluginDirs(const std::unordered_set<std::string>& enabled,
   }
 }
 
-std::vector<std::wstring> pluginSearchDirs() {
+// Every mod's plugin directory in Steam Workshop content (dependency search roots: the mod's
+// enabled state is irrelevant here).
+void discoverAllWorkshopPluginDirs(std::vector<std::wstring>& out) {
+  const std::vector<std::wstring> roots = steamLibraryRoots();
+  if (roots.empty()) {
+    logDebug(L"Steam installation not found; skipping Workshop discovery");
+    return;
+  }
+  for (const std::wstring& root : roots) {
+    discoverAllModPluginDirs(root + L"\\steamapps\\workshop\\content\\289070", out);
+  }
+}
+
+// The Loader's own plugin directories (phase A): no enabled-mod-list dependency, so they are always
+// scanned. The loader's own mod is by definition enabled.
+std::vector<std::wstring> loaderOwnPluginDirs() {
   std::vector<std::wstring> dirs;
   const std::wstring base = moduleDirectory();
   if (base.empty()) {
     return dirs;
   }
   // Scan only the dedicated plugin directories; never load arbitrary DLLs from the game Binaries
-  // directory. The loader's own mod is by definition enabled, so its directory is always scanned.
+  // directory.
   addUnique(dirs, base + L"\\ykkz000_civ6_plugin");
   addUnique(dirs, base + L"\\..\\..\\..\\..\\ykkz000_civ6_plugin");
+  return dirs;
+}
 
-  // Cross-mod discovery is gated on the engine's live enabled-mod list. When the engine has not yet
-  // published it, do not guess: load only the loader's own plugins rather than risking a disabled
-  // mod's plugin.
-  std::vector<std::string> enabledIds;
-  if (!enabledModIds(enabledIds)) {
-    logWarn(
-        "Enabled-mod list unavailable from the engine; scanning only the loader's own plugin "
-        "directory");
-    return dirs;
-  }
-  logInfoF("Engine enabled-mod count: %zu", enabledIds.size());
-  std::unordered_set<std::string> enabled;
-  for (const std::string& id : enabledIds) {
-    std::string lowered = toLowerAscii(id);
-    logDebugF("enabled mod id: %s", lowered.c_str());
-    enabled.insert(std::move(lowered));
-  }
-
+// Cross-mod plugin directories (phase B): the plugin directories carried by other enabled mods, in
+// the Documents Mods directory and in Steam Workshop content.
+std::vector<std::wstring> crossModPluginDirs(const std::unordered_set<std::string>& enabled) {
+  std::vector<std::wstring> dirs;
   const std::wstring documents = documentsModsRoot();
   if (!documents.empty()) {
     discoverModPluginDirs(documents, enabled, dirs);
   }
   discoverWorkshopPluginDirs(enabled, dirs);
+  return dirs;
+}
+
+// The game executable's directory: the base for the relative .modinfo paths the engine stores for
+// base-game and DLC content ("../../../DLC/Expansion2/Expansion2.modinfo").
+std::wstring hostExecutableDirectory() {
+  wchar_t buffer[MAX_PATH] = {};
+  const DWORD length = GetModuleFileNameW(GetModuleHandleW(nullptr), buffer, MAX_PATH);
+  if (length == 0 || length >= MAX_PATH) {
+    return {};
+  }
+  const std::wstring path(buffer, length);
+  const std::size_t slash = path.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? std::wstring{} : path.substr(0, slash);
+}
+
+// Add the plugin directory of the mod a scanned .modinfo path belongs to. The path may be absolute
+// (either separator) or relative to the game executable's directory, as the engine stores both
+// forms; a mod root without a plugin directory is a cheap no-op.
+void addModPluginDirByModinfo(const std::wstring& modinfoPath, std::vector<std::wstring>& out) {
+  if (modinfoPath.empty()) {
+    return;
+  }
+  const bool absolute = modinfoPath.size() >= 2 && (modinfoPath[1] == L':' ||
+                       (modinfoPath[0] == L'\\' && modinfoPath[1] == L'\\'));
+  std::wstring candidate = modinfoPath;
+  if (!absolute) {
+    const std::wstring base = hostExecutableDirectory();
+    if (base.empty()) {
+      return;
+    }
+    candidate = base + L"\\" + candidate;
+  }
+  const std::wstring full = normalized(candidate);
+  const std::size_t slash = full.find_last_of(L"\\/");
+  if (slash == std::wstring::npos || slash == 0) {
+    return;
+  }
+  (void)findModPluginDir(full.substr(0, slash), out);
+}
+
+// Plugin directories derived from the seeded .modinfo paths, restricted to the seeded enabled set.
+std::vector<std::wstring> seededModPluginDirs(
+    const std::unordered_set<std::string>& enabled,
+    const std::vector<std::pair<std::string, std::wstring>>& modinfoPaths) {
+  std::vector<std::wstring> dirs;
+  for (const std::pair<std::string, std::wstring>& entry : modinfoPaths) {
+    if (enabled.count(toLowerAscii(entry.first)) == 0) {
+      continue;
+    }
+    addModPluginDirByModinfo(entry.second, dirs);
+  }
+  return dirs;
+}
+
+// Dependency search roots: the plugin directories of every mod (enabled or not) in the Documents
+// Mods directory and in Steam Workshop content. Registered on the process DLL search path only, so
+// a consumer can import an API DLL another mod ships, while plugin discovery stays restricted to
+// the enabled set.
+std::vector<std::wstring> allModPluginDirs() {
+  std::vector<std::wstring> dirs;
+  const std::wstring documents = documentsModsRoot();
+  if (!documents.empty()) {
+    discoverAllModPluginDirs(documents, dirs);
+  }
+  discoverAllWorkshopPluginDirs(dirs);
   return dirs;
 }
 
@@ -520,15 +655,26 @@ void discoverPlugins(const std::wstring& directory, std::vector<Candidate>& out)
 }
 
 // Phase 2: validate manifests and compute the dependency-topological initialization order.
-// Rejected candidates keep ok=false; the caller releases their modules.
-void orderCandidates(std::vector<Candidate>& candidates, std::vector<std::size_t>& order) {
+// Rejected candidates keep ok=false; the caller releases their modules. `satisfied` holds plugin
+// names already loaded by an earlier phase (phase A); such names satisfy dependencies and must not be
+// duplicated by a new candidate.
+void orderCandidates(std::vector<Candidate>& candidates, std::vector<std::size_t>& order,
+                     const std::unordered_set<std::string>& satisfied) {
   LogScope scope("resolve plugin order");
 
-  // Name uniqueness: a duplicated logical name invalidates every candidate that uses it.
+  // Name uniqueness: a duplicated logical name invalidates every candidate that uses it. A name that
+  // matches an already-loaded plugin is a duplicate too and is rejected.
   std::unordered_map<std::string, std::size_t> byName;
   for (std::size_t i = 0; i < candidates.size(); ++i) {
     Candidate& candidate = candidates[i];
     if (!candidate.ok) {
+      continue;
+    }
+    if (satisfied.count(candidate.name) != 0) {
+      candidate.ok = false;
+      candidate.reason = "duplicate plugin name (already loaded)";
+      logErrorF("plugin: '%s' duplicates an already-loaded plugin; rejected",
+                candidate.name.c_str());
       continue;
     }
     const auto it = byName.find(candidate.name);
@@ -591,6 +737,9 @@ void orderCandidates(std::vector<Candidate>& candidates, std::vector<std::size_t
         continue;
       }
       for (const std::string& dep : candidate.deps) {
+        if (satisfied.count(dep) != 0) {
+          continue; // provided by an already-loaded plugin
+        }
         const auto it = byName.find(dep);
         if (it == byName.end() || !candidates[it->second].ok) {
           candidate.ok = false;
@@ -615,6 +764,9 @@ void orderCandidates(std::vector<Candidate>& candidates, std::vector<std::size_t
       continue;
     }
     for (const std::string& dep : candidates[i].deps) {
+      if (satisfied.count(dep) != 0) {
+        continue; // an already-loaded plugin provides this dependency: no graph edge
+      }
       const std::size_t j = byName[dep];
       if (j == i) {
         ++indegree[i]; // self-dependency: unsatisfiable, detected as a cycle below
@@ -732,19 +884,57 @@ void loadPlugins(bridge::Host* host) {
   }
   LogScope scope("load plugins (core)");
   g_pluginsLoaded = true;
+  g_hostTemplate = host; // stashed for the deferred cross-mod phase
 
   std::vector<Candidate> candidates;
-  const std::vector<std::wstring> directories = pluginSearchDirs();
-  // Register every candidate directory on the process search path before loading, so a consumer in
-  // one directory can import the API DLLs it declares as dependencies from another directory.
-  addDllSearchDirectories(directories);
-  logInfo(L"Plugin search directory count: " + std::to_wstring(directories.size()));
+  std::vector<std::wstring> directories = loaderOwnPluginDirs();
+  // Mods.sqlite selected-group enabled set (seeded by the proxy before the engine published its own
+  // settings): when present, the other enabled mods' plugin directories are discovered and loaded
+  // in this same phase, so their plugins register effect types before the real
+  // DllCreateGameContext builds and validates the effect database.
+  if (!g_groupEnabledModIds.empty()) {
+    std::unordered_set<std::string> enabled;
+    enabled.reserve(g_groupEnabledModIds.size());
+    for (const std::string& id : g_groupEnabledModIds) {
+      enabled.insert(toLowerAscii(id));
+    }
+    const std::vector<std::wstring> crossDirs = crossModPluginDirs(enabled);
+    for (const std::wstring& directory : crossDirs) {
+      addUnique(directories, directory);
+    }
+    // Seeded .modinfo paths reach enabled mods outside the Documents Mods and Workshop roots;
+    // probing a mod root without a plugin directory is a cheap no-op.
+    for (const std::wstring& directory : seededModPluginDirs(enabled, g_groupEnabledModInfoPaths)) {
+      addUnique(directories, directory);
+    }
+    // The seeded set is fixed for the process lifetime unless a later Mods.sqlite re-read replaces
+    // it: the deferred phase has nothing left to load, so mark it complete. Its triggers then stay
+    // no-ops (already-loaded plugins would otherwise be rejected as duplicates on a re-scan).
+    g_crossModLoaded = true;
+    logInfoF("cross-mod: Mods.sqlite group enabled-mod set (%zu ids); loading now", enabled.size());
+  }
+  // Dependency search path: the load directories plus every mod's plugin directory (enabled or
+  // not). Registering them lets a consumer in one directory import the API DLLs it declares as
+  // dependencies from another mod's directory; the discovery loop below still runs only over the
+  // load directories, so a disabled mod's plugin DLLs are resolvable but never loaded.
+  std::vector<std::wstring> searchDirectories = directories;
+  for (const std::wstring& directory : allModPluginDirs()) {
+    addUnique(searchDirectories, directory);
+  }
+  addDllSearchDirectories(searchDirectories);
+  logInfo(L"Plugin search directory count: " + std::to_wstring(searchDirectories.size()));
+#if defined(_DEBUG)
+  for (const std::wstring& directory : searchDirectories) {
+    logDebug(L"Plugin search path: " + directory);
+  }
+#endif
   for (const std::wstring& directory : directories) {
     discoverPlugins(directory, candidates);
   }
 
   std::vector<std::size_t> order;
-  orderCandidates(candidates, order);
+  const std::unordered_set<std::string> satisfied;
+  orderCandidates(candidates, order, satisfied);
 
   // Release rejected candidates (invalid manifest, duplicate name, missing dependency, cycle).
   for (Candidate& candidate : candidates) {
@@ -765,6 +955,96 @@ void loadPlugins(bridge::Host* host) {
   }
 
   logInfo(L"Plugin loading finished; loaded count: " + std::to_wstring(g_plugins.size()));
+}
+
+void setGroupEnabledModIds(std::vector<std::string> ids) {
+  g_groupEnabledModIds = std::move(ids);
+}
+
+void setGroupEnabledModInfoPaths(
+    std::vector<std::pair<std::string, std::wstring>> idToModinfoPath) {
+  g_groupEnabledModInfoPaths = std::move(idToModinfoPath);
+}
+
+bool loadCrossModPluginsDeferred() {
+  if (g_crossModLoaded) {
+    return true;
+  }
+  if (g_hostTemplate == nullptr) {
+    return false; // phase A has not run yet
+  }
+
+  // The Mods.sqlite selected group is the only enabled-mod source: without a seeded set there is
+  // nothing to scan, so the phase stays pending and a later Mods.sqlite re-read can still seed it.
+  if (g_groupEnabledModIds.empty()) {
+    logDebug("cross-mod: the Mods.sqlite selected group has not been seeded; deferring");
+    return false;
+  }
+  std::unordered_set<std::string> enabled;
+  enabled.reserve(g_groupEnabledModIds.size());
+  for (const std::string& id : g_groupEnabledModIds) {
+    enabled.insert(toLowerAscii(id));
+  }
+  logInfoF("cross-mod: Mods.sqlite group enabled-mod count: %zu", enabled.size());
+
+  // Phase-A plugins already satisfy dependencies of cross-mod plugins.
+  std::unordered_set<std::string> satisfied;
+  for (PluginSlot* slot : g_plugins) {
+    satisfied.insert(slot->name);
+  }
+
+  LogScope scope("load plugins (cross-mod)");
+  std::vector<std::wstring> dirs = crossModPluginDirs(enabled);
+  for (const std::wstring& dir : seededModPluginDirs(enabled, g_groupEnabledModInfoPaths)) {
+    addUnique(dirs, dir);
+  }
+  std::vector<Candidate> candidates;
+  // Same split as phase A: the load dirs decide what is scanned; every mod's plugin directory is
+  // additionally registered for DLL dependency resolution.
+  std::vector<std::wstring> searchDirs = dirs;
+  for (const std::wstring& dir : allModPluginDirs()) {
+    addUnique(searchDirs, dir);
+  }
+  addDllSearchDirectories(searchDirs);
+  logInfo(L"cross-mod plugin search directory count: " + std::to_wstring(searchDirs.size()));
+  for (const std::wstring& d : dirs) {
+    discoverPlugins(d, candidates);
+  }
+
+  std::vector<std::size_t> order;
+  orderCandidates(candidates, order, satisfied);
+
+  // Release rejected candidates (invalid manifest, duplicate name, missing dependency, cycle).
+  for (Candidate& c : candidates) {
+    if (!c.ok && c.module != nullptr) {
+      FreeLibrary(c.module);
+      c.module = nullptr;
+    }
+  }
+
+  const std::size_t before = g_plugins.size();
+  initializeCandidates(candidates, order, *g_hostTemplate);
+
+  // Release any module not claimed by a slot (skipped candidates and failures).
+  for (Candidate& c : candidates) {
+    if (c.module != nullptr) {
+      FreeLibrary(c.module);
+      c.module = nullptr;
+    }
+  }
+
+  // Newly loaded plugins missed the kCreated broadcast (this runs after createGameContext): notify
+  // only the slots added in this call, never the already-loaded ones.
+  for (std::size_t i = before; i < g_plugins.size(); ++i) {
+    if (g_plugins[i]->listener != nullptr) {
+      callListenerGuarded(g_plugins[i]->listener, bridge::GameContextEvent::kCreated, nullptr);
+    }
+  }
+
+  g_crossModLoaded = true;
+  logInfo(L"cross-mod: plugin loading finished; total loaded=" +
+          std::to_wstring(g_plugins.size()));
+  return true;
 }
 
 void setActivePluginHandle(void* pluginHandle) {
@@ -813,6 +1093,7 @@ void unloadPlugins() {
   }
   g_plugins.clear();
   g_pluginsLoaded = false;
+  g_crossModLoaded = false;
   removeDllSearchDirectories();
 }
 

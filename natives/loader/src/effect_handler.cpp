@@ -187,6 +187,42 @@ std::atomic<long> s_applyCalls{0};
 // needs a forward declaration.
 int registerCustomEffectHandlersForRoot(void* root);
 
+// Content-load trigger: load deferred cross-mod plugins as soon as the Mods.sqlite group
+// enabled-mod set has been seeded. Before the handler table exists this only registers effect types
+// (the normal post-registry-init pass registers their handlers).
+bool tryDeferredCrossModLoad() { return loadCrossModPluginsDeferred(); }
+
+// Fallback path for a late load: trigger the deferred cross-mod load and, when it loaded plugins,
+// register their handlers against the live root. Guarded against re-entry through the
+// set-effect-handler detour (which would otherwise recurse while re-registering).
+bool g_crossModHandlersRegistered = false;
+void loadAndReregisterCrossMod() {
+  if (g_crossModHandlersRegistered) {
+    return; // already handled (idempotent; runs at most once per load)
+  }
+  if (g_registerDepth != 0) {
+    return;
+  }
+  if (!tryDeferredCrossModLoad()) {
+    return;
+  }
+  void* root = nullptr;
+  {
+    std::lock_guard<std::mutex> guard(g_handlerMutex);
+    root = g_registeredRoot;
+  }
+  if (root == nullptr) {
+    return; // no live root yet; a later hook call retries
+  }
+  ++g_registerDepth;
+  registerCustomEffectHandlersForRoot(root);
+  --g_registerDepth;
+  g_crossModHandlersRegistered = true;
+}
+
+// One-shot trigger for the analyze/apply fallbacks (those detours are called many times per context).
+std::once_flag g_crossModFallbackOnce;
+
 void SetEffectHandler_Hook(void* root, int kind, std::uint32_t hash, void* handlerObject) {
   const long call = ++s_setCalls;
   if (call <= kTraceFullCalls || (call % kTraceStride) == 0) {
@@ -223,6 +259,10 @@ void SetEffectHandler_Hook(void* root, int kind, std::uint32_t hash, void* handl
       --g_registerDepth;
     }
   }
+
+  // Fallback content-load trigger: if the enabled-mod list only became available after registry-init,
+  // load the deferred cross-mod plugins here and register their handlers against the live root.
+  loadAndReregisterCrossMod();
 }
 
 // hook FUN_180489040(container, outNode, hashPtr): handler table insert/lookup. Whether inserting
@@ -394,6 +434,7 @@ void* customEffectHandlerObject(std::uint32_t effectHash, std::uint32_t template
 }
 
 void* TemplateAnalyze_Hook(void* self, void* args) {
+  std::call_once(g_crossModFallbackOnce, []() { loadAndReregisterCrossMod(); });
   const long call = ++s_analyzeCalls;
   if (call <= kTraceFullCalls || (call % kTraceStride) == 0) {
     const HandlerTableSizes sizes = handlerTableSizes();
@@ -404,6 +445,7 @@ void* TemplateAnalyze_Hook(void* self, void* args) {
 }
 
 std::uint64_t TemplateApply_Hook(void* self, void* context, void* args) {
+  std::call_once(g_crossModFallbackOnce, []() { loadAndReregisterCrossMod(); });
   const long call = ++s_applyCalls;
   if (call <= kTraceFullCalls || (call % kTraceStride) == 0) {
     int amount = -1;
@@ -584,8 +626,20 @@ void* HandlerRegistryInit_Hook(void* root) {
     g_handlerRoot = root;
     g_registeredRoot = root; // the init table has been re-registered
   }
+  // Primary content-load trigger (the earliest content-load hook): load the deferred cross-mod
+  // plugins before the engine builds the handler table, so the registerCustomEffectHandlersForRoot
+  // call below registers their handlers. Plugins call installHook/registerEffectType, not the
+  // handler table, so this does not re-enter registry-init.
+  const bool crossModReady = tryDeferredCrossModLoad();
+  if (crossModReady) {
+    logInfo("cross-mod: plugins loaded before handler table build");
+  }
+  logDebugF("cross-mod: registryInit trigger crossModLoaded=%d", crossModReady ? 1 : 0);
   void* result = g_originalHandlerRegistryInit(root);
   registerCustomEffectHandlersForRoot(root);
+  if (crossModReady) {
+    g_crossModHandlersRegistered = true; // already registered above for this root
+  }
   return result;
 }
 
